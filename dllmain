@@ -1,0 +1,138 @@
+/*
+* ClientLauncherFixer
+* Author:NavyOops
+* Github:@NavyOops
+*/
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <Windows.h>
+#include <iostream>
+#include <Psapi.h>
+#include <vector>
+#include <algorithm>
+#include <thread>
+#include "detours.h"
+
+#pragma comment(lib, "ws2_32.lib")
+#ifdef _WIN64
+#pragma comment (lib,"detours_x64.lib")
+#elif defined(_WIN32)
+#pragma comment (lib,"detours_x86.lib")
+#endif
+
+typedef void(*ExitProcess_type)(UINT uExitCode);
+ExitProcess_type originalExitProcess;
+void my_ExitProcess(UINT uExitCode);
+
+PVOID GetProcessModuleBase(HANDLE hProcess, LPCSTR moduleName);
+UINT64 GetFunAddrByName(HANDLE hProcess, LPCSTR ModName, LPCSTR FunName);
+
+PVOID GetProcessModuleBase(HANDLE hProcess, LPCSTR moduleName)
+{
+	// 遍历进程模块,
+	HMODULE hModule[100] = {0};
+	DWORD dwRet = 0;
+	BOOL bRet = ::EnumProcessModules(hProcess, (HMODULE*)(hModule), sizeof(hModule), &dwRet);
+	if (FALSE == bRet)
+	{
+		::CloseHandle(hProcess);
+		return NULL;
+	}
+	char name[50] = {0};
+	for (int i = 0; i < dwRet; i++)
+	{
+		GetModuleBaseNameA(hProcess, hModule[i], name, 50);
+
+		if (!_strcmpi(moduleName, name))
+		{
+			return hModule[i];
+		}
+	}
+
+	::CloseHandle(hProcess);
+	return NULL;
+}
+UINT64 GetFunAddrByName(HANDLE hProcess, LPCSTR ModName, LPCSTR FunName)
+{
+	HANDLE hMod;
+	PVOID BaseAddress = NULL;
+	IMAGE_DOS_HEADER dosheader;
+	IMAGE_OPTIONAL_HEADER64 opthdr; //IMAGE_OPTIONAL_HEADER64
+	IMAGE_EXPORT_DIRECTORY exports;
+	USHORT index = 0;
+	ULONG addr, i;
+	char pFuncName[100] = {0};
+	PULONG pAddressOfFunctions;
+	PULONG pAddressOfNames;
+	PUSHORT pAddressOfNameOrdinals;
+
+	//获取模块基址
+	BaseAddress = GetProcessModuleBase(hProcess, ModName);
+	if (!BaseAddress) return 0;
+
+	//获取PE头
+	hMod = BaseAddress;
+	ReadProcessMemory(hProcess, hMod, &dosheader, sizeof(IMAGE_DOS_HEADER), 0);
+	ReadProcessMemory(hProcess, (BYTE*)hMod + dosheader.e_lfanew + 24, &opthdr, sizeof(IMAGE_OPTIONAL_HEADER), 0);
+	//ReadProcessMemory(hProcess, (BYTE*)hMod + dosheader.e_lfanew + 24, &opthdr, sizeof(IMAGE_OPTIONAL_HEADER64), 0);
+
+	//查找导出表 
+	ReadProcessMemory(hProcess, ((BYTE*)hMod + opthdr.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress),
+	                  &exports, sizeof(IMAGE_EXPORT_DIRECTORY), 0);
+
+	pAddressOfFunctions = (ULONG*)((BYTE*)hMod + exports.AddressOfFunctions);
+	pAddressOfNames = (ULONG*)((BYTE*)hMod + exports.AddressOfNames);
+	pAddressOfNameOrdinals = (USHORT*)((BYTE*)hMod + exports.AddressOfNameOrdinals);
+
+	//对比函数名 
+	for (i = 0; i < exports.NumberOfNames; i++)
+	{
+		ReadProcessMemory(hProcess, pAddressOfNameOrdinals + i, &index, sizeof(USHORT), 0);
+		ReadProcessMemory(hProcess, pAddressOfFunctions + index, &addr, sizeof(ULONG), 0);
+
+		ULONG a = 0;
+		ReadProcessMemory(hProcess, pAddressOfNames + i, &a, sizeof(ULONG), 0);
+		ReadProcessMemory(hProcess, (BYTE*)hMod + a, pFuncName, 100, 0);
+		ReadProcessMemory(hProcess, pAddressOfFunctions + index, &addr, sizeof(ULONG), 0);
+
+		if (!_stricmp(pFuncName, FunName))
+		{
+			UINT64 funAddr = (UINT64)BaseAddress + addr;
+			return funAddr;
+		}
+	}
+	return 0;
+}
+
+
+void my_ExitProcess(UINT uExitCode)
+{
+	printf("MyExitProcess _ no exit");
+	//originalExitProcess(uExitCode); 执行原方法
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule,
+                      DWORD ul_reason_for_call,
+                      LPVOID lpReserved
+)
+{
+	switch (ul_reason_for_call)
+	{
+	case DLL_PROCESS_ATTACH:
+		{
+
+			void* base_address = reinterpret_cast<void*>(GetFunAddrByName(GetCurrentProcess(), "kernel32.dll", "ExitProcess"));
+			originalExitProcess = reinterpret_cast<ExitProcess_type>(base_address);
+			printf("ClientLauncherFixer-NavyOops-24/3/17");
+			DetourTransactionBegin();
+			DetourUpdateThread(GetCurrentThread());
+			DetourAttach(&reinterpret_cast<PVOID&>(originalExitProcess), my_ExitProcess);
+			DetourTransactionCommit();
+		}
+	case DLL_THREAD_ATTACH:
+	case DLL_THREAD_DETACH:
+	case DLL_PROCESS_DETACH:
+		break;
+	}
+	return TRUE;
+}
